@@ -15,7 +15,7 @@ export interface RestoredCache {
 
 export async function runRestoreCache(
   inputs: Inputs,
-  runtime: RuntimeRequest | undefined,
+  runtimes: readonly RuntimeRequest[],
 ): Promise<RestoredCache> {
   const cachePath = await getCacheDirectory()
   saveState('cache_path', cachePath)
@@ -25,7 +25,7 @@ export async function runRestoreCache(
     throw new Error('Some specified paths were not resolved, unable to cache dependencies.')
   }
 
-  const keyPrefix = getCacheKeyPrefix(process.env.RUNNER_OS, os.arch(), runtime)
+  const keyPrefix = getCacheKeyPrefix(process.env.RUNNER_OS, os.arch(), runtimes)
   const provisionalKey = getPrimaryCacheKey(keyPrefix, fileHash)
   debug(`Provisional cache key is ${provisionalKey}`)
   saveState('cache_provisional_key', provisionalKey)
@@ -46,11 +46,11 @@ export async function runRestoreCache(
   return { fileHash, keyPrefix, restoredKey }
 }
 
-export function finalizeCache(cache: RestoredCache, resolvedRuntimeVersion: string | undefined) {
+export function finalizeCache(cache: RestoredCache, resolvedRuntimes: readonly RuntimeRequest[]) {
   const primaryKey = getPrimaryCacheKey(
     cache.keyPrefix,
     cache.fileHash,
-    resolvedRuntimeVersion,
+    resolvedRuntimes,
   )
   debug(`Primary key is ${primaryKey}`)
   saveState('cache_primary_key', primaryKey)

@@ -6,7 +6,7 @@ import { finalizeCache, RestoredCache, runRestoreCache } from './run'
 
 export async function restoreCache(
   inputs: Inputs,
-  runtime: RuntimeRequest | undefined,
+  runtimes: readonly RuntimeRequest[],
 ): Promise<RestoredCache | undefined> {
   if (!inputs.cache) return
 
@@ -16,7 +16,7 @@ export async function restoreCache(
   }
 
   startGroup('Restoring cache...')
-  const restoredCache = await runRestoreCache(inputs, runtime)
+  const restoredCache = await runRestoreCache(inputs, runtimes)
   endGroup()
   return restoredCache
 }

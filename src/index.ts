@@ -4,10 +4,11 @@ import saveCache from './cache-save'
 import getInputs, { Inputs } from './inputs'
 import installPnpm from './install-pnpm'
 import {
-  getInstalledRuntimeVersion,
-  resolveRuntimeRequest,
+  getInstalledRuntimeVersions,
+  resolveRuntimeRequests,
   installRuntime,
   InstalledRuntime,
+  keepInstalledRuntimesAuthoritative,
   logSkippedRuntime,
 } from './install-runtime'
 import setOutputs from './outputs'
@@ -30,32 +31,45 @@ async function runMain() {
   const result = await installPnpm(inputs)
   console.log('Installation Completed!')
 
-  const request = resolveRuntimeRequest(inputs)
-  const restoredCache = await restoreCache(inputs, request)
+  const requests = resolveRuntimeRequests(inputs)
+  const restoredCache = await restoreCache(inputs, requests)
 
-  let runtime: InstalledRuntime | undefined
-  if (request) {
-    runtime = await installRuntime(request, result.binDest)
+  const runtimes: InstalledRuntime[] = []
+  for (const request of requests) {
+    const runtime = await installRuntime(request, result.binDest)
     if (runtime === undefined) return
+    runtimes.push(runtime)
+  }
+  if (runtimes.length > 0) {
+    keepInstalledRuntimesAuthoritative(runtimes)
   } else {
     logSkippedRuntime()
   }
 
+  // `pnpm runtime set` takes a selector, so `runtimes` holds what was asked
+  // for — `node@lts`, `node@24`. Both the outputs and the cache key promise
+  // the version that actually landed, so read it back once and use it for
+  // both. Falling back to the selector also keeps the final cache key
+  // distinct from the provisional key the restore probed with; that key must
+  // never be written to, or later runs would match it exactly and stop
+  // falling back to the prefix search that finds the versioned caches.
+  const installedVersions = await getInstalledRuntimeVersions(
+    runtimes.map(runtime => runtime.name),
+    result.binDest,
+  )
+  const installed = runtimes.map(runtime => ({
+    name: runtime.name,
+    version: installedVersions.get(runtime.name) ?? runtime.version,
+  }))
+
   if (restoredCache) {
-    // Falling back to the requested selector keeps the final key distinct
-    // from the provisional key the restore probed with. That key must never
-    // be written to: later runs match it exactly and would stop falling back
-    // to the prefix search that finds the versioned caches.
-    const resolvedRuntimeVersion = request
-      ? await getInstalledRuntimeVersion(request.name, result.binDest) ?? request.version
-      : undefined
-    finalizeCache(restoredCache, resolvedRuntimeVersion)
+    finalizeCache(restoredCache, installed)
   }
 
-  setOutputs(inputs, result.binDest, runtime)
+  setOutputs(inputs, result.binDest, installed)
 
   if (inputs.install) {
-    pnpmInstall(inputs)
+    pnpmInstall(inputs, runtimes.length > 0)
   }
 }
 

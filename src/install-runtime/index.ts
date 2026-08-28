@@ -23,17 +23,17 @@ export interface RuntimeRequest {
   readonly version: string
 }
 
-export function resolveRuntimeRequest(inputs: Inputs): RuntimeRequest | undefined {
+export function resolveRuntimeRequests(inputs: Inputs): RuntimeRequest[] {
   // Explicit `runtime` input always wins. `runtime.version` falls back to
   // devEngines.runtime if not provided — useful for matrix workflows that
   // pick the runtime but keep the version pinned in the manifest.
   if (inputs.runtime) {
     const { name } = inputs.runtime
     const version = inputs.runtime.version ?? readDevEngineVersion(inputs, name) ?? defaultVersionFor(name)
-    return { name, version }
+    return [{ name, version }]
   }
 
-  return readFirstDevEngineRuntime(inputs)
+  return readDevEngineRuntimes(inputs)
 }
 
 export async function installRuntime(
@@ -55,34 +55,44 @@ export async function installRuntime(
     setFailed(`pnpm runtime set ${request.name} ${request.version} -g exited with code ${exitCode}`)
     return undefined
   }
-  keepInstalledRuntimeAuthoritative(request.name)
   return { name: request.name, version: request.version }
 }
 
 /**
- * Read the version `pnpm runtime set` actually installed, so a moving
- * selector such as `node@lts` is cached under the version it resolved to.
+ * Read the versions `pnpm runtime set` actually installed, so that a moving
+ * selector such as `node@lts` is reported and cached under the version it
+ * resolved to. One listing covers every runtime, so this stays a single
+ * subprocess no matter how many `devEngines.runtime` declares.
  *
- * This only refines a cache key, so it must never fail the run: a change in
- * `pnpm list --json` output would otherwise break setup for every workflow
- * that enables the cache. Report the problem and let the caller fall back.
+ * This only refines outputs and a cache key, so it must never fail the run:
+ * a change in `pnpm list --json` output would otherwise break setup for every
+ * workflow that installs a runtime. Report the problem and let the caller
+ * fall back to the requested selector.
  */
-export async function getInstalledRuntimeVersion(
-  name: RuntimeName,
+export async function getInstalledRuntimeVersions(
+  names: readonly RuntimeName[],
   binDest: string,
-): Promise<string | undefined> {
+): Promise<Map<RuntimeName, string>> {
+  const versions = new Map<RuntimeName, string>()
+  if (names.length === 0) return versions
+
   try {
     const stdout = await runPnpmForOutput(binDest, ['list', '--global', '--json', '--depth', '0'])
     const listing = JSON.parse(stdout) as Array<{
       readonly dependencies?: Record<string, { readonly version?: string }>
     }>
-    const version = listing[0]?.dependencies?.[name]?.version
-    if (version) return version
-    warning(`Unable to determine the installed ${name} version from "pnpm list --global"`)
+    for (const name of names) {
+      const version = listing[0]?.dependencies?.[name]?.version
+      if (version) {
+        versions.set(name, version)
+      } else {
+        warning(`Unable to determine the installed ${name} version from "pnpm list --global"`)
+      }
+    }
   } catch (err: unknown) {
-    warning(`Unable to determine the installed ${name} version: ${err instanceof Error ? err.message : String(err)}`)
+    warning(`Unable to determine the installed runtime versions: ${err instanceof Error ? err.message : String(err)}`)
   }
-  return undefined
+  return versions
 }
 
 /**
@@ -92,18 +102,24 @@ export async function getInstalledRuntimeVersion(
  * the version this action was asked to install — a matrix job asking for
  * `node@22` would run the repository's pinned version instead — and even
  * when the two agree it materializes a second copy outside `$PNPM_HOME`.
- * Turn the shim off for the runtime we installed, leaving every other
+ * Turn the shims off for the runtimes we installed, leaving every other
  * runtime at pnpm's defaults. A value the workflow set itself always wins.
  */
-function keepInstalledRuntimeAuthoritative(name: RuntimeName) {
+export function keepInstalledRuntimesAuthoritative(runtimes: readonly InstalledRuntime[]) {
+  if (runtimes.length === 0) return
+
   // An empty value counts as unset, the same rule pnpm applies when it reads
-  // these — stepping aside for a value pnpm ignores would leave the shim on.
+  // these — stepping aside for a value pnpm ignores would leave the shims on.
   const configured = GLOBAL_SHIMS_ENV_NAMES.find(envName => process.env[envName])
   if (configured) {
     info(`\`${configured}\` is already set; leaving pnpm's context-aware shims as configured.`)
     return
   }
-  exportVariable(GLOBAL_SHIMS_ENV_NAMES[0], JSON.stringify({ [name]: false }))
+
+  exportVariable(
+    GLOBAL_SHIMS_ENV_NAMES[0],
+    JSON.stringify(Object.fromEntries(runtimes.map(runtime => [runtime.name, false]))),
+  )
 }
 
 export function logSkippedRuntime() {
@@ -140,18 +156,28 @@ function readDevEngineEntries(inputs: Inputs): DevEngineRuntimeEntry[] {
   return Array.isArray(runtime) ? (runtime as DevEngineRuntimeEntry[]) : [runtime as DevEngineRuntimeEntry]
 }
 
+// Resolve through the deduped list so an explicit `runtime` input picks the
+// same declaration the manifest-driven path would, and warns about the
+// duplicate the same way.
 function readDevEngineVersion(inputs: Inputs, name: RuntimeName): string | undefined {
-  const match = readDevEngineEntries(inputs).find(e => e.name === name)
-  return match?.version
+  return readDevEngineRuntimes(inputs).find(runtime => runtime.name === name)?.version
 }
 
-function readFirstDevEngineRuntime(inputs: Inputs): RuntimeRequest | undefined {
+function readDevEngineRuntimes(inputs: Inputs): RuntimeRequest[] {
+  const runtimes = new Map<RuntimeName, RuntimeRequest>()
   for (const entry of readDevEngineEntries(inputs)) {
-    if (!entry.name || !entry.version) continue
-    if (!SUPPORTED_RUNTIMES.has(entry.name as RuntimeName)) continue
-    return { name: entry.name as RuntimeName, version: entry.version }
+    if (!entry.name || !entry.version || !SUPPORTED_RUNTIMES.has(entry.name as RuntimeName)) continue
+
+    const name = entry.name as RuntimeName
+    const previous = runtimes.get(name)
+    if (previous) {
+      warning(
+        `Duplicate ${name} runtime versions declared in devEngines.runtime (${previous.version} and ${entry.version}); using the last declared version ${entry.version}.`,
+      )
+    }
+    runtimes.set(name, { name, version: entry.version })
   }
-  return undefined
+  return [...runtimes.values()]
 }
 
 function runPnpm(binDest: string, args: string[]): Promise<number> {
